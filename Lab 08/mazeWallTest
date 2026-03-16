@@ -1,0 +1,131 @@
+// --- Motor Pins ---
+#define enA 11
+#define enB 6
+#define in1 13
+#define in2 12
+#define in3 8
+#define in4 7
+
+// --- Ultrasonic Pins ---
+#define trigFront 9
+#define echoFront 10
+#define trigLeft 3
+#define echoLeft 4
+
+// --- Tuning ---
+const int baseSpeed = 100;
+const int rightBoost = 150;
+const int turnDuration = 650;
+#define TARGET_WALL_DIST 20
+#define KP 3
+
+void setup() {
+  pinMode(enA, OUTPUT); pinMode(enB, OUTPUT);
+  pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+  pinMode(trigFront, OUTPUT); pinMode(echoFront, INPUT);
+  pinMode(trigLeft, OUTPUT);  pinMode(echoLeft, INPUT);
+  Serial.begin(9600);
+}
+
+void loop() {
+  long FS = getDistance(trigFront, echoFront);
+  long LS = getDistance(trigLeft, echoLeft);
+
+  int currentSpeed = (FS < 50) ? baseSpeed - 30 : baseSpeed;
+
+  Serial.print("F="); Serial.print(FS);
+  Serial.print(" L="); Serial.println(LS);
+
+  if (FS <= 30 && LS <= 40) {
+    Serial.println("Front+Left blocked → Turn RIGHT");
+    stopCar(); delay(100);
+    turnRight(baseSpeed); delay(turnDuration);
+    stopCar(); delay(100);
+
+  } else if (FS <= 30 && LS > 40) {
+    Serial.println("Front blocked, left open → Turn LEFT");
+    stopCar(); delay(100);
+    turnLeft(baseSpeed); delay(turnDuration);
+    stopCar(); delay(100);
+
+  } else if (FS > 30 && LS > 40) {
+    Serial.println("Left open → curve LEFT");
+    stopCar(); delay(100);
+    turnLeft(baseSpeed); delay(turnDuration / 2);
+    stopCar(); delay(100);
+
+  } else {
+    moveStraightAdjusted(currentSpeed, LS);
+  }
+
+  delay(100);
+}
+
+// --- Distance ---
+
+long getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 30000);
+  if (duration == 0) return 999;
+  return duration * 0.034 / 2;
+}
+
+// --- Motor Helpers ---
+
+int R(int spd) {
+  return constrain(spd + rightBoost, 0, 255);
+}
+
+void stopCar() {
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
+  analogWrite(enA, 0);    analogWrite(enB, 0);
+}
+
+void moveStraight(int spd) {
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  analogWrite(enB, spd);
+  analogWrite(enA, R(spd));
+}
+
+void moveStraightAdjusted(int spd, long leftDist) {
+  if (leftDist > 100) {
+    // No left wall detected — just go straight
+    moveStraight(spd);
+    return;
+  }
+
+  int error = leftDist - TARGET_WALL_DIST;
+  int correction = constrain(KP * error, -40, 40);
+
+  int leftMotor  = constrain(spd - correction, 0, 255);
+  int rightMotor = constrain(spd + correction, 0, 255);
+
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  analogWrite(enB, leftMotor);
+  analogWrite(enA, R(rightMotor));
+
+  Serial.print("  err="); Serial.print(error);
+  Serial.print(" cor="); Serial.println(correction);
+}
+
+void turnRight(int spd) {
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  analogWrite(enB, spd);
+  analogWrite(enA, R(spd));
+}
+
+void turnLeft(int spd) {
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  analogWrite(enB, spd);
+  analogWrite(enA, R(spd));
+}
