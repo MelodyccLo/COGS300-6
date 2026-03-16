@@ -32,21 +32,21 @@ void loop() {
   Serial.print("F="); Serial.print(FS);
   Serial.print(" L="); Serial.println(LS);
 
-  if (LS > 50) {
-    Serial.println("Left open → Turn LEFT");
-    stopCar(); delay(100);
-    turnLeft(baseSpeed);
-    delay(turnDuration);
-    stopCar(); delay(100);
-  }
-  else if (FS < 15) {
-    Serial.println("Front wall → Turn RIGHT");
-    stopCar(); delay(100);
-    turnRight(baseSpeed);
-    delay(turnDuration);
-    stopCar(); delay(100);
-  }
-  else {
+  if (FS < 15) {
+    if (LS < 30) {
+      Serial.println("Front wall + Left wall → Turn RIGHT");
+      stopCar(); delay(100);
+      turnRight(baseSpeed);
+      delay(turnDuration);
+      stopCar(); delay(100);
+    } else {
+      Serial.println("Front wall + Left open → Turn LEFT");
+      stopCar(); delay(100);
+      turnLeft(baseSpeed);
+      delay(turnDuration);
+      stopCar(); delay(100);
+    }
+  } else {
     Serial.println("Clear → Straight");
     moveStraight(baseSpeed);
   }
