@@ -1,0 +1,127 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  3-Sensor Line Follower — white tape on dark floor
+//
+//  Sensor layout (front of robot):
+//        [L: A1]   [M: A2]   [R: A0]
+//
+//  L and R sit just OUTSIDE the tape edges.
+//  M sits ON the tape centre.
+//  Normal cruise: L=dark, M=white, R=dark
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Pins ────────────────────────────────────────────────────────────────────
+#define enA    11
+#define enB     6
+#define in1    13
+#define in2    12
+#define in3     8
+#define in4     7
+
+#define irRight A0
+#define irLeft  A1
+#define irMid   A2
+
+// ─── Tuning ──────────────────────────────────────────────────────────────────
+const int THRESHOLD   = 400;
+const int BASE_SPEED  = 130;
+const int TURN_SPEED  = 115;
+const int DRIFT_INNER = 30;
+const float DRIFT     = 1.0;
+
+// ─── State ───────────────────────────────────────────────────────────────────
+int lastTurn = 0;
+bool inAllWhite = false;                             // ← NEW
+unsigned long allWhiteStart = 0;                     // ← NEW
+const unsigned long INTERSECTION_THRESHOLD_MS = 100;  // ← NEW (tune this!)
+
+// ═══════════════════════════════════════════════════════════════════════════
+void setup() {
+  pinMode(enA, OUTPUT); pinMode(enB, OUTPUT);
+  pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+  pinMode(irRight, INPUT);
+  pinMode(irLeft,  INPUT);
+  pinMode(irMid,   INPUT);
+  Serial.begin(9600);
+  Serial.println("Line Follower Ready");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+void loop() {
+  bool L = (analogRead(irLeft)  < THRESHOLD);
+  bool M = (analogRead(irMid)   < THRESHOLD);
+  bool R = (analogRead(irRight) < THRESHOLD);
+
+  if (L && M && R) {
+    if (!inAllWhite) {
+        inAllWhite = true;
+        allWhiteStart = millis();
+    } else if (millis() - allWhiteStart >= INTERSECTION_THRESHOLD_MS) {
+        // We've been all-white long enough — it's a real intersection!
+        snapRight(TURN_SPEED);
+    } else {
+        // Not long enough yet, keep going while we decide
+        moveStraight(BASE_SPEED);
+    }
+
+  } else if (!L && !M && !R) {
+    inAllWhite = false;
+    if (lastTurn == 1) driftLeft(BASE_SPEED);
+    else               driftRight(BASE_SPEED);
+
+  } else if (L && !R) {
+    inAllWhite = false;
+    lastTurn = -1;
+    snapRight(TURN_SPEED);
+
+  } else if (R && !L) {
+    inAllWhite = false;
+    lastTurn = 1;
+    snapLeft(TURN_SPEED);
+
+  } else {
+    inAllWhite = false;
+    moveStraight(BASE_SPEED);
+  }
+}
+
+// ─── Movement ────────────────────────────────────────────────────────────────
+void moveStraight(int spd) {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);   // Right forward (flipped)
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);  // Left forward  (flipped)
+  analogWrite(enA, spd);
+  analogWrite(enB, (int)(spd * DRIFT));
+}
+
+// Both wheels forward, right slowed → arcs right
+void driftRight(int spd) {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);   // Right forward (flipped)
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);  // Left forward  (flipped)
+  analogWrite(enA, spd);
+  analogWrite(enB, DRIFT_INNER);
+}
+
+// Both wheels forward, left slowed → arcs left
+void driftLeft(int spd) {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);   // Right forward (flipped)
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);  // Left forward  (flipped)
+  analogWrite(enA, DRIFT_INNER);
+  analogWrite(enB, spd);
+}
+
+void snapRight(int spd) {
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);  // Right backward (flipped)
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);  // Left forward   (flipped)
+  analogWrite(enA, spd);   analogWrite(enB, spd);
+}
+
+void snapLeft(int spd) {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);   // Right forward (flipped)
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);   // Left backward (flipped)
+  analogWrite(enA, spd);   analogWrite(enB, spd);
+}
+
+void stopMotors() {
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW); analogWrite(enA, 0);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW); analogWrite(enB, 0);
+}
