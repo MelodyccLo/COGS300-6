@@ -1,0 +1,299 @@
+// ─── Pins ────────────────────────────────────────────────────────────────────
+#define enA        11
+#define enB         6
+#define in1        13
+#define in2        12
+#define in3         8
+#define in4         7
+#define irRight    A0
+#define irLeft     A1
+#define irMid      A2
+#define TRIG_PIN    2
+#define ECHO_PIN    3
+#define TOUCH_PIN   4   // bump switch or capacitive sensor on objects
+
+// ─── Tuning ──────────────────────────────────────────────────────────────────
+const int   THRESHOLD     = 400;   // analog: below = white (tape)
+const int   BASE_SPEED    = 120;
+const int   MAX_SPEED     = 180;
+const int   MIN_SPEED     = 40;
+const int   TURN_SPEED    = 110;
+
+// PID gains — tune Kp first, then Kd
+const float Kp = 35.0;
+const float Ki = 0.0;   // start at 0, add small amount if steady-state drift
+const float Kd = 15.0;
+
+// Maze / roundabout
+const int   WALL_STOP_CM  = 12;    // stop if wall closer than this
+const int   SIDE_CLEAR_CM = 20;    // "lane is clear" threshold for maze turns
+
+// Object detection
+const int   OBJ_CLOSE_CM  = 8;     // approach and touch within this distance
+
+// ─── State Machine ───────────────────────────────────────────────────────────
+enum RobotPhase {
+  PHASE_LINE_FOLLOW,
+  PHASE_MAZE,
+  PHASE_OBJECT_DETECT,
+  PHASE_DONE
+};
+
+RobotPhase phase = PHASE_LINE_FOLLOW;
+
+// ─── PID state ───────────────────────────────────────────────────────────────
+float pidError    = 0;
+float pidLast     = 0;
+float pidIntegral = 0;
+int   lastTurn    = 0;   // -1=left, 1=right, used for all-dark recovery
+
+// ─── Maze state ──────────────────────────────────────────────────────────────
+// Simple right-hand rule: keep right wall, turn right when clear,
+// go straight if right blocked, turn left if both blocked.
+unsigned long mazeEntryTime = 0;
+
+// ─── Object detection state ──────────────────────────────────────────────────
+int  objectsTouched = 0;
+bool approachingObject = false;
+
+// ═══════════════════════════════════════════════════════════════════════════
+void setup() {
+  pinMode(enA, OUTPUT); pinMode(enB, OUTPUT);
+  pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(TOUCH_PIN, INPUT_PULLUP);
+  Serial.begin(9600);
+  Serial.println("Robot Ready");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+void loop() {
+  switch (phase) {
+    case PHASE_LINE_FOLLOW:   runLineFollow();    break;
+    case PHASE_MAZE:          runMaze();          break;
+    case PHASE_OBJECT_DETECT: runObjectDetect();  break;
+    case PHASE_DONE:          stopMotors();       break;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PHASE 1 — PID LINE FOLLOWING
+// ════════════════════════════════════════════════════════════════════════════
+// Position error:  -2=far left, -1=left, 0=centre, +1=right, +2=far right
+// All-white = intersection → transition to maze
+// All-dark  = lost → recover using lastTurn direction
+
+void runLineFollow() {
+  int rawL = analogRead(irLeft);
+  int rawM = analogRead(irMid);
+  int rawR = analogRead(irRight);
+
+  bool L = (rawL < THRESHOLD);
+  bool M = (rawM < THRESHOLD);
+  bool R = (rawR < THRESHOLD);
+
+  Serial.print("L:"); Serial.print(rawL);
+  Serial.print(" M:"); Serial.print(rawM);
+  Serial.print(" R:"); Serial.println(rawR);
+
+  // ── Intersection detection (all white) ──────────────────────────────────
+  if (L && M && R) {
+    // Crossed from line-follow zone into maze — transition
+    stopMotors();
+    delay(200);
+    phase = PHASE_MAZE;
+    mazeEntryTime = millis();
+    return;
+  }
+
+  // ── Lost (all dark) — use last known direction ───────────────────────────
+  if (!L && !M && !R) {
+    if (lastTurn >= 0) snapRight(TURN_SPEED);
+    else               snapLeft(TURN_SPEED);
+    return;
+  }
+
+  // ── Compute weighted error ───────────────────────────────────────────────
+  // Sensor weights:  L=-2, M=0, R=+2 (positive = drifting right)
+  // Use the analog values inverted so white (low reading) = high weight
+  float wL = (1023 - rawL);
+  float wM = (1023 - rawM);
+  float wR = (1023 - rawR);
+  float total = wL + wM + wR;
+
+  float position = 0;
+  if (total > 0)
+    position = (-2.0 * wL + 0.0 * wM + 2.0 * wR) / total;
+
+  // Track last turn direction for recovery
+  if (position < -0.3) lastTurn = -1;
+  if (position >  0.3) lastTurn =  1;
+
+  // ── PID ──────────────────────────────────────────────────────────────────
+  pidError     = position;
+  pidIntegral += pidError;
+  pidIntegral  = constrain(pidIntegral, -50, 50);  // anti-windup
+  float derivative = pidError - pidLast;
+  float correction  = Kp * pidError + Ki * pidIntegral + Kd * derivative;
+  pidLast = pidError;
+
+  int leftSpeed  = constrain(BASE_SPEED + (int)correction, MIN_SPEED, MAX_SPEED);
+  int rightSpeed = constrain(BASE_SPEED - (int)correction, MIN_SPEED, MAX_SPEED);
+
+  setMotors(leftSpeed, rightSpeed);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PHASE 2 — MAZE (right-hand wall following)
+// ════════════════════════════════════════════════════════════════════════════
+// Mount ultrasonic facing FORWARD. Rotate robot to ping sides if needed,
+// or add a second sensor. This implementation assumes one forward sensor
+// and uses timed turns to navigate (practical for simple cardboard mazes).
+
+void runMaze() {
+  int frontDist = getDistanceCM();
+  Serial.print("Maze front dist: "); Serial.println(frontDist);
+
+  // ── Roundabout detection: if you've been turning continuously for >2s
+  //    assume roundabout — complete one full loop then exit forward
+  // (Customize this logic to your specific maze layout)
+
+  if (frontDist > WALL_STOP_CM) {
+    // Path ahead is clear — go straight
+    moveStraight(BASE_SPEED);
+  } else {
+    // Wall ahead — try turning right first (right-hand rule)
+    stopMotors();
+    delay(100);
+
+    // Rotate right 90° (tune duration for your robot)
+    snapRight(TURN_SPEED);
+    delay(500);   // ~90° turn — calibrate this!
+    stopMotors();
+    delay(100);
+
+    int newFront = getDistanceCM();
+    if (newFront <= WALL_STOP_CM) {
+      // Right is also blocked — turn left instead (180° from original)
+      snapLeft(TURN_SPEED);
+      delay(1000);  // ~180° — calibrate!
+      stopMotors();
+      delay(100);
+    }
+  }
+
+  // ── Exit condition: tape on floor signals end of maze ───────────────────
+  bool L = (analogRead(irLeft)  < THRESHOLD);
+  bool M = (analogRead(irMid)   < THRESHOLD);
+  bool R = (analogRead(irRight) < THRESHOLD);
+  if (M && !L && !R) {
+    // Found the line again — transition to object detection
+    phase = PHASE_OBJECT_DETECT;
+    Serial.println("→ Object Detection phase");
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PHASE 3 — OBJECT DETECTION (touch 3 non-TNT objects)
+// Strategy: scan with ultrasonic, approach nearest object, verify with
+// touch sensor. If touch registered → count it, back up, find next.
+
+void runObjectDetect() {
+  if (objectsTouched >= 3) {
+    phase = PHASE_DONE;
+    stopMotors();
+    Serial.println("Done! 3 objects touched.");
+    return;
+  }
+
+  int dist = getDistanceCM();
+
+  if (dist > OBJ_CLOSE_CM) {
+    // Creep forward slowly toward object
+    moveStraight(MIN_SPEED);
+  } else {
+    // Close enough — stop and check touch
+    stopMotors();
+    delay(100);
+
+    bool touched = (digitalRead(TOUCH_PIN) == LOW); // LOW = pressed w/ pullup
+    if (touched) {
+      objectsTouched++;
+      Serial.print("Object touched! Count: ");
+      Serial.println(objectsTouched);
+
+      // Back up and turn to find next object
+      reverseMotors(BASE_SPEED);
+      delay(500);
+      stopMotors();
+      delay(100);
+      snapRight(TURN_SPEED);
+      delay(400);   // ~45° sweep to find next object
+      stopMotors();
+    } else {
+      // Something's close but no touch — might be TNT, avoid it!
+      Serial.println("No touch — avoiding (possible TNT)");
+      reverseMotors(BASE_SPEED);
+      delay(300);
+      stopMotors();
+      snapLeft(TURN_SPEED);
+      delay(600);
+      stopMotors();
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// MOTOR HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+
+// leftSpeed / rightSpeed: positive = forward
+void setMotors(int leftSpeed, int rightSpeed) {
+  // Left motor (enB / in3 / in4)
+  if (leftSpeed >= 0) {
+    digitalWrite(in3, LOW);
+    digitalWrite(in4, HIGH);
+  } else {
+    digitalWrite(in3, HIGH);
+    digitalWrite(in4, LOW);
+    leftSpeed = -leftSpeed;
+  }
+  analogWrite(enB, constrain(leftSpeed, 0, 255));
+
+  // Right motor (enA / in1 / in2)
+  if (rightSpeed >= 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  } else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    rightSpeed = -rightSpeed;
+  }
+  analogWrite(enA, constrain(rightSpeed, 0, 255));
+}
+
+void moveStraight(int spd)     { setMotors(spd, spd); }
+void reverseMotors(int spd)    { setMotors(-spd, -spd); }
+void snapRight(int spd)        { setMotors(spd, -spd); }
+void snapLeft(int spd)         { setMotors(-spd, spd); }
+
+void stopMotors() {
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW); analogWrite(enA, 0);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW); analogWrite(enB, 0);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ULTRASONIC
+// ════════════════════════════════════════════════════════════════════════════
+int getDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 20000); // 20ms timeout
+  if (duration == 0) return 999;  // no echo = open space
+  return (int)(duration * 0.034 / 2);
+}
