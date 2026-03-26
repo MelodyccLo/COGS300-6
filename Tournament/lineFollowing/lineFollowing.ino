@@ -1,0 +1,155 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  3-Sensor Line Follower — white tape on dark floor
+//
+//  Sensor layout (front of robot):
+//        [L: A1]   [M: A2]   [R: A0]
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Pins ────────────────────────────────────────────────────────────────────
+#define enA    11
+#define enB     6
+#define in1    13
+#define in2    12
+#define in3     8
+#define in4     7
+
+#define irRight A0
+#define irLeft  A1
+#define irMid   A2
+
+// ─── Tuning ──────────────────────────────────────────────────────────────────
+const int THRESHOLD      = 400;
+const int BASE_SPEED     = 130;
+const int TURN_SPEED     = 115;
+const int RECOVER_SPEED  = 110; // speed during recovery snap and lunge
+const float DRIFT        = 1.0;
+
+// Recovery behaviour — tune these two
+const unsigned long SNAP_MS   = 100; // how long to snap turn before lunging forward
+const unsigned long LUNGE_MS  = 80;  // how long to drive straight before snapping again
+
+// ─── State ───────────────────────────────────────────────────────────────────
+int lastTurn = 1; // -1 = left, 1 = right — never 0
+
+bool inAllWhite = false;
+unsigned long allWhiteStart = 0;
+const unsigned long INTERSECTION_THRESHOLD_MS = 100;
+
+// Recovery sub-states
+enum RecoverState { SNAPPING, LUNGING };
+RecoverState recoverState = SNAPPING;
+unsigned long recoverTimer = 0;
+bool wasLost = false;
+
+// ═══════════════════════════════════════════════════════════════════════════
+void setup() {
+  pinMode(enA, OUTPUT); pinMode(enB, OUTPUT);
+  pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+  pinMode(irRight, INPUT);
+  pinMode(irLeft,  INPUT);
+  pinMode(irMid,   INPUT);
+  Serial.begin(9600);
+  Serial.println("Line Follower Ready");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+void loop() {
+  bool L = (analogRead(irLeft)  < THRESHOLD);
+  bool M = (analogRead(irMid)   < THRESHOLD);
+  bool R = (analogRead(irRight) < THRESHOLD);
+
+  bool onLine = L || M || R;
+
+  // ── Found the line — exit recovery ───────────────────────────────────────
+  if (wasLost && onLine) {
+    wasLost = false;
+  }
+
+  // ── Lost — run snap+lunge recovery ───────────────────────────────────────
+  if (!onLine) {
+    if (!wasLost) {
+      // Just lost the line — start fresh with a snap
+      wasLost      = true;
+      recoverState = SNAPPING;
+      recoverTimer = millis();
+    }
+
+    unsigned long elapsed = millis() - recoverTimer;
+
+    if (recoverState == SNAPPING) {
+      // Sharp turn in last known direction
+      if (lastTurn == -1) snapLeft(RECOVER_SPEED);
+      else                snapRight(RECOVER_SPEED);
+
+      if (elapsed >= SNAP_MS) {
+        // Done snapping — lunge forward
+        recoverState = LUNGING;
+        recoverTimer = millis();
+      }
+
+    } else {
+      // Drive straight forward to cover ground
+      moveStraight(RECOVER_SPEED);
+
+      if (elapsed >= LUNGE_MS) {
+        // Done lunging — snap again
+        recoverState = SNAPPING;
+        recoverTimer = millis();
+      }
+    }
+
+    return; // skip normal following while lost
+  }
+
+  // ── Normal line-following ─────────────────────────────────────────────────
+  if (L && M && R) {
+    if (!inAllWhite) {
+      inAllWhite    = true;
+      allWhiteStart = millis();
+    } else if (millis() - allWhiteStart >= INTERSECTION_THRESHOLD_MS) {
+      snapRight(TURN_SPEED);
+    } else {
+      moveStraight(BASE_SPEED);
+    }
+
+  } else if (L && !R) {
+    inAllWhite = false;
+    lastTurn   = -1;
+    snapLeft(TURN_SPEED);
+
+  } else if (R && !L) {
+    inAllWhite = false;
+    lastTurn   = 1;
+    snapRight(TURN_SPEED);
+
+  } else {
+    inAllWhite = false;
+    moveStraight(BASE_SPEED);
+  }
+}
+
+// ─── Movement ────────────────────────────────────────────────────────────────
+void moveStraight(int spd) {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+  analogWrite(enA, spd);
+  analogWrite(enB, (int)(spd * DRIFT));
+}
+
+void snapRight(int spd) {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  analogWrite(enA, spd);   analogWrite(enB, spd);
+}
+
+void snapLeft(int spd) {
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+  analogWrite(enA, spd);   analogWrite(enB, spd);
+}
+
+void stopMotors() {
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW); analogWrite(enA, 0);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW); analogWrite(enB, 0);
+}
