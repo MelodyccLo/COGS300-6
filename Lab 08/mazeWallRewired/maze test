@@ -1,0 +1,197 @@
+#define enA 11
+#define enB 6
+#define in1 13
+#define in2 12
+#define in3 8
+#define in4 7
+
+#define trigFront 9
+#define echoFront 10
+#define trigLeft  3
+#define echoLeft  4
+
+const int BASE_SPEED      = 100;
+const int TURN_SPEED      = 110;
+const int LEFT_BOOST      = 0;       // trim if robot drifts going straight
+
+const int FRONT_STOP_CM   = 15;      // wall ahead → turn
+const int LEFT_TARGET_CM  = 12;      // ideal gap to left wall
+const int LEFT_OPEN_CM    = 28;      // left is open → opportunity to turn left
+const int TURN_MIN_MS     = 300;     // minimum rotation before sensor-checking
+const int TURN_MAX_MS     = 900;     // abort turn if it takes too long
+const int POST_TURN_MS    = 150;     // nudge forward after turn to clear corner
+
+const float WF_Kp = 4.0;
+const float WF_Kd = 2.0;
+float wfLastError = 0;
+bool  wfFirstReading = true;
+
+void setup() {
+  pinMode(enA, OUTPUT); pinMode(enB, OUTPUT);
+  pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+  pinMode(trigFront, OUTPUT); pinMode(echoFront, INPUT);
+  pinMode(trigLeft,  OUTPUT); pinMode(echoLeft,  INPUT);
+  Serial.begin(9600);
+  Serial.println("Maze Ready");
+}
+
+void loop() {
+  long F = getDistance(trigFront, echoFront);
+  long L = getDistance(trigLeft,  echoLeft);
+
+  Serial.print("F="); Serial.print(F);
+  Serial.print(" L="); Serial.println(L);
+
+  // Priority 1: front blocked → turn right
+  if (F < FRONT_STOP_CM) {
+    Serial.println("Front wall → Turn RIGHT");
+    doTurnRight();
+    return;
+  }
+
+  // Priority 2: left is open AND front is getting close → take the left turn
+  // Tighter front gate (25cm) prevents spurious turns in open areas
+  if (L > LEFT_OPEN_CM && F < 25) {
+    Serial.println("Left open → Turn LEFT");
+    doTurnLeft();
+    return;
+  }
+
+  // Priority 3: go straight with left-wall PID correction
+  wallFollowStraight(L);
+}
+
+// Wall follow — PID keeps LEFT_TARGET_CM gap from left wall
+void wallFollowStraight(long leftDist) {
+  float error = 0;
+
+  if (leftDist < 999) {
+    error = (float)(leftDist - LEFT_TARGET_CM);
+    // Positive error = too far right → correct left (increase left speed)
+  }
+
+  // Seed derivative on first reading to avoid spike
+  if (wfFirstReading) { wfLastError = error; wfFirstReading = false; }
+
+  float derivative = error - wfLastError;
+  float correction  = WF_Kp * error + WF_Kd * derivative;
+  wfLastError = error;
+
+  // Positive correction → too far from wall → speed up right motor to push left
+  // YOUR wiring: enA=right motor, enB=left motor
+  int rightSpeed = constrain(BASE_SPEED + (int)correction, 40, 200);
+  int leftSpeed  = constrain(BASE_SPEED - (int)correction, 40, 200);
+
+  motorDrive(leftSpeed, rightSpeed);
+}
+
+// Sensor-confirmed turns with minimum rotation guard
+void doTurnRight() {
+  stopCar(); delay(80);
+
+  unsigned long start = millis();
+  while (millis() - start < TURN_MAX_MS) {
+    turnRight(TURN_SPEED);
+    delay(20);
+
+    // Only start checking sensors after minimum rotation time
+    if (millis() - start < TURN_MIN_MS) continue;
+
+    long F = getDistance(trigFront, echoFront);
+    long L = getDistance(trigLeft,  echoLeft);
+
+    // Done: front clear, and new left wall has come into range
+    if (F > FRONT_STOP_CM + 8 && L < LEFT_OPEN_CM) {
+      Serial.println("Turn RIGHT done");
+      break;
+    }
+  }
+
+  stopCar(); delay(80);
+  // Nudge forward to clear the corner fully
+  moveStraight(BASE_SPEED);
+  delay(POST_TURN_MS);
+  stopCar(); delay(50);
+
+  // Seed wall-follow with current reading to avoid derivative spike
+  wfLastError = (float)(getDistance(trigLeft, echoLeft) - LEFT_TARGET_CM);
+  wfFirstReading = false;
+}
+
+void doTurnLeft() {
+  stopCar(); delay(80);
+
+  // Nudge forward so robot is past the junction before rotating
+  moveStraight(BASE_SPEED);
+  delay(POST_TURN_MS);
+  stopCar(); delay(80);
+
+  unsigned long start = millis();
+  while (millis() - start < TURN_MAX_MS) {
+    turnLeft(TURN_SPEED);
+    delay(20);
+
+    if (millis() - start < TURN_MIN_MS) continue;
+
+    long F = getDistance(trigFront, echoFront);
+    long L = getDistance(trigLeft,  echoLeft);
+
+    // Done: front clear, left wall back in range (we're in the new corridor)
+    if (F > FRONT_STOP_CM + 8 && L < LEFT_OPEN_CM) {
+      Serial.println("Turn LEFT done");
+      break;
+    }
+  }
+
+  stopCar(); delay(80);
+
+  wfLastError = (float)(getDistance(trigLeft, echoLeft) - LEFT_TARGET_CM);
+  wfFirstReading = false;
+}
+
+int boosted(int spd) { return constrain(spd + LEFT_BOOST, 0, 255); }
+
+void moveStraight(int spd) {
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH); // left forward
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);  // right forward
+  analogWrite(enB, boosted(spd));
+  analogWrite(enA, spd);
+}
+
+void turnLeft(int spd) {
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH); // left forward
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH); // right backward
+  analogWrite(enB, boosted(spd));
+  analogWrite(enA, spd);
+}
+
+void turnRight(int spd) {
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);  // left backward
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);  // right forward
+  analogWrite(enB, boosted(spd));
+  analogWrite(enA, spd);
+}
+
+// Wall-follow uses independent left/right speed control
+void motorDrive(int leftSpd, int rightSpd) {
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  analogWrite(enB, constrain(boosted(leftSpd),  0, 255));
+  analogWrite(enA, constrain(rightSpd,          0, 255));
+}
+
+void stopCar() {
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
+  analogWrite(enA, 0); analogWrite(enB, 0);
+}
+
+long getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 25000);
+  if (duration == 0) return 999;
+  return duration * 0.034 / 2;
+}
