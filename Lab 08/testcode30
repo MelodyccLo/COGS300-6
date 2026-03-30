@@ -1,0 +1,376 @@
+// ─── Motor Pins ──────────────────────────────────────────────────────────────
+#define enA 11
+#define enB 6
+#define in1 13
+#define in2 12
+#define in3 8
+#define in4 7
+
+// ─── IR Sensor Pins ──────────────────────────────────────────────────────────
+#define irRight A0
+#define irLeft  A1
+#define irMid   A2
+
+// ─── Ultrasonic Pins ─────────────────────────────────────────────────────────
+#define trigFront 9
+#define echoFront 10
+#define trigLeft  3
+#define echoLeft  4
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GLOBAL STATE
+// ═══════════════════════════════════════════════════════════════════════════
+enum RobotMode { LINE_FOLLOWING, WALL_FOLLOWING };
+RobotMode mode = LINE_FOLLOWING;
+
+// ─── Transition detection ────────────────────────────────────────────────────
+int transitionCount = 0;
+const int TRANSITION_REQUIRED = 5;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SHARED SPEED SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════
+const int BASE_SPEED  = 130;
+const int TURN_SPEED  = 130;
+const int BACK_SPEED  = 130;
+const int leftBoost   = 0;
+const int rightBoost  = 25;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LINE FOLLOWER SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════
+const int IR_THRESHOLD = 400;
+const unsigned long SNAP_MS  = 100;
+const unsigned long LUNGE_MS = 80;
+
+int  lastTurn   = 1;
+bool inAllWhite = false;
+unsigned long allWhiteStart = 0;
+const unsigned long INTERSECTION_THRESHOLD_MS = 100;
+
+enum RecoverState { SNAPPING, LUNGING };
+RecoverState recoverState = SNAPPING;
+unsigned long recoverTimer = 0;
+bool wasLost = false;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WALL FOLLOWER SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════
+const int FRONT_STOP    = 15;
+const int LEFT_OPEN     = 35;
+const int LEFT_TARGET   = 12;
+const int TURN_MIN_MS   = 300;
+const int TURN_MAX_MS   = 900;
+const int BACK_DURATION = 250;
+
+const float WF_Kp = 3.5;
+const float WF_Kd = 1.5;
+float wfLastError    = 0;
+bool  wfFirstReading = true;
+
+long lastFrontDist = 0;
+unsigned long stuckTimer = 0;
+const unsigned long stuckThreshold = 5000;
+const int stuckTolerance = 3;
+
+// ═══════════════════════════════════════════════════════════════════════════
+void setup() {
+  pinMode(enA, OUTPUT); pinMode(enB, OUTPUT);
+  pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+  pinMode(irRight, INPUT); pinMode(irLeft, INPUT); pinMode(irMid, INPUT);
+  pinMode(trigFront, OUTPUT); pinMode(echoFront, INPUT);
+  pinMode(trigLeft,  OUTPUT); pinMode(echoLeft,  INPUT);
+  Serial.begin(9600);
+  Serial.println("=== Maze Robot Ready — LINE mode ===");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+void loop() {
+  if (mode == LINE_FOLLOWING) runLineFollower();
+  else                        runWallFollower();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRANSITION CHECK
+// ═══════════════════════════════════════════════════════════════════════════
+bool checkTransitionToWall(bool allWhiteTrigger) {
+  long FS = getDistanceAvg(trigFront, echoFront);
+  long LS = getDistanceAvg(trigLeft,  echoLeft);
+
+  Serial.print("[TRANSITION?] F="); Serial.print(FS);
+  Serial.print(" L="); Serial.print(LS);
+  Serial.print(" count="); Serial.println(transitionCount);
+
+  bool wallsClose = (LS < 70 && FS < 60);
+
+  if (wallsClose || allWhiteTrigger) {
+    transitionCount++;
+    if (transitionCount >= TRANSITION_REQUIRED) {
+      Serial.println(">>> SWITCHING TO WALL FOLLOWING <<<");
+      mode = WALL_FOLLOWING;
+      lastFrontDist  = FS;
+      stuckTimer     = millis();
+      wfLastError    = (float)(LS - LEFT_TARGET);
+      wfFirstReading = false;
+      return true;
+    }
+  } else {
+    transitionCount = 0;
+  }
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STAGE 1 — LINE FOLLOWER
+// ═══════════════════════════════════════════════════════════════════════════
+void runLineFollower() {
+  bool L = (analogRead(irLeft)  < IR_THRESHOLD);
+  bool M = (analogRead(irMid)   < IR_THRESHOLD);
+  bool R = (analogRead(irRight) < IR_THRESHOLD);
+
+  bool onLine = L || M || R;
+
+  if (wasLost && onLine) {
+    wasLost = false;
+    transitionCount = 0;
+  }
+
+  // ── No line detected ───────────────────────────────────────────────────
+  if (!onLine) {
+    if (checkTransitionToWall(false)) return;
+
+    if (!wasLost) {
+      wasLost      = true;
+      recoverState = SNAPPING;
+      recoverTimer = millis();
+    }
+
+    unsigned long elapsed = millis() - recoverTimer;
+    if (recoverState == SNAPPING) {
+      if (lastTurn == -1) snapLeft(TURN_SPEED);
+      else                snapRight(TURN_SPEED);
+      if (elapsed >= SNAP_MS) {
+        recoverState = LUNGING;
+        recoverTimer = millis();
+      }
+    } else {
+      moveStraight(BASE_SPEED);
+      if (elapsed >= LUNGE_MS) {
+        recoverState = SNAPPING;
+        recoverTimer = millis();
+      }
+    }
+    return;
+  }
+
+  // ── All 3 sensors white — intersection or maze entry ──────────────────
+  if (L && M && R) {
+    if (!inAllWhite) {
+      inAllWhite    = true;
+      allWhiteStart = millis();
+    }
+    if (millis() - allWhiteStart >= INTERSECTION_THRESHOLD_MS) {
+      if (checkTransitionToWall(true)) return;
+      snapRight(TURN_SPEED);
+    } else {
+      moveStraight(BASE_SPEED);
+    }
+    return;
+  }
+
+  inAllWhite = false;
+
+  // ── Normal line following ──────────────────────────────────────────────
+  if (L && !R) {
+    lastTurn = -1;
+    snapLeft(TURN_SPEED);
+  } else if (R && !L) {
+    lastTurn = 1;
+    snapRight(TURN_SPEED);
+  } else {
+    moveStraight(BASE_SPEED);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STAGE 2 — WALL FOLLOWER
+// ═══════════════════════════════════════════════════════════════════════════
+void runWallFollower() {
+  long FS = getDistanceAvg(trigFront, echoFront);
+  long LS = getDistanceAvg(trigLeft,  echoLeft);
+
+  Serial.print("F="); Serial.print(FS);
+  Serial.print(" L="); Serial.println(LS);
+
+  // ── Stuck detection ────────────────────────────────────────────────────
+  if (abs(FS - lastFrontDist) > stuckTolerance) {
+    stuckTimer    = millis();
+    lastFrontDist = FS;
+  }
+
+  if (millis() - stuckTimer > stuckThreshold) {
+    Serial.println("Stuck → Back + Adjust");
+    stopCar(); delay(100);
+    moveBackward(BACK_SPEED); delay(BACK_DURATION);
+    stopCar(); delay(100);
+
+    long lsCheck = getDistanceAvg(trigLeft, echoLeft);
+    if (lsCheck > LEFT_OPEN) doTurnLeft();
+    else                     doTurnRight();
+
+    lastFrontDist = getDistanceAvg(trigFront, echoFront);
+    stuckTimer    = millis();
+    return;
+  }
+
+  // ── Wall ahead ────────────────────────────────────────────────────────
+  if (FS <= FRONT_STOP) {
+    Serial.println("Wall ahead → stop + turn");
+    stopCar(); delay(100);
+    moveBackward(BACK_SPEED); delay(BACK_DURATION);
+    stopCar(); delay(100);
+
+    long lsCheck = getDistanceAvg(trigLeft, echoLeft);
+    if (lsCheck > LEFT_OPEN) {
+      Serial.println("Left open → LEFT");
+      doTurnLeft();
+    } else {
+      Serial.println("Left blocked → RIGHT");
+      doTurnRight();
+    }
+    return;
+  }
+
+  // ── Straight with left-wall PID correction ────────────────────────────
+  wallFollowStraight(LS);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WALL-FOLLOW STRAIGHT — PID keeps LEFT_TARGET gap from left wall
+// ═══════════════════════════════════════════════════════════════════════════
+void wallFollowStraight(long leftDist) {
+  float error = 0;
+
+  if (leftDist < 999) {
+    error = (float)(leftDist - LEFT_TARGET);
+  }
+
+  if (wfFirstReading) { wfLastError = error; wfFirstReading = false; }
+
+  float derivative = error - wfLastError;
+  float correction = WF_Kp * error + WF_Kd * derivative;
+  wfLastError = error;
+
+  int lSpd = constrain(BASE_SPEED + (int)correction, 40, 200);
+  int rSpd = constrain(BASE_SPEED - (int)correction, 40, 200);
+
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+  analogWrite(enA, constrain(lSpd + leftBoost,  0, 255));
+  analogWrite(enB, constrain(rSpd + rightBoost, 0, 255));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SENSOR-CONFIRMED TURNS
+// ═══════════════════════════════════════════════════════════════════════════
+void doTurnRight() {
+  unsigned long start = millis();
+  while (millis() - start < TURN_MAX_MS) {
+    turnRight(TURN_SPEED);
+    delay(20);
+    if (millis() - start < TURN_MIN_MS) continue;
+
+    long F = getDistanceAvg(trigFront, echoFront);
+    long L = getDistanceAvg(trigLeft,  echoLeft);
+    if (F > FRONT_STOP + 8 && L < LEFT_OPEN) {
+      Serial.println("Turn RIGHT complete");
+      break;
+    }
+  }
+  stopCar(); delay(80);
+  wfLastError    = (float)(getDistanceAvg(trigLeft, echoLeft) - LEFT_TARGET);
+  wfFirstReading = false;
+}
+
+void doTurnLeft() {
+  moveStraight(BASE_SPEED); delay(150);
+  stopCar(); delay(80);
+
+  unsigned long start = millis();
+  while (millis() - start < TURN_MAX_MS) {
+    turnLeft(TURN_SPEED);
+    delay(20);
+    if (millis() - start < TURN_MIN_MS) continue;
+
+    long F = getDistanceAvg(trigFront, echoFront);
+    long L = getDistanceAvg(trigLeft,  echoLeft);
+    if (F > FRONT_STOP + 8 && L < LEFT_OPEN) {
+      Serial.println("Turn LEFT complete");
+      break;
+    }
+  }
+  stopCar(); delay(80);
+  wfLastError    = (float)(getDistanceAvg(trigLeft, echoLeft) - LEFT_TARGET);
+  wfFirstReading = false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SENSOR HELPER
+// ═══════════════════════════════════════════════════════════════════════════
+long getDistanceAvg(int trig, int echo) {
+  long total = 0;
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(trig, LOW);  delayMicroseconds(2);
+    digitalWrite(trig, HIGH); delayMicroseconds(10);
+    digitalWrite(trig, LOW);
+    long duration = pulseIn(echo, HIGH, 25000);
+    total += (duration == 0) ? 999 : duration * 0.034 / 2;
+    delay(2);
+  }
+  return total / 3;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIFIED MOTOR HELPERS
+// enA = left motor (in1/in2), enB = right motor (in3/in4)
+// ═══════════════════════════════════════════════════════════════════════════
+int Lspd(int spd) { return constrain(spd + leftBoost,  0, 255); }
+int Rspd(int spd) { return constrain(spd + rightBoost, 0, 255); }
+
+void moveStraight(int spd) {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+  analogWrite(enA, Lspd(spd));
+  analogWrite(enB, Rspd(spd));
+}
+
+void moveBackward(int spd) {
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  analogWrite(enA, Lspd(spd));
+  analogWrite(enB, Rspd(spd));
+}
+
+void snapRight(int spd) {
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
+  analogWrite(enA, Lspd(spd));
+  analogWrite(enB, Rspd(spd));
+}
+
+void snapLeft(int spd) {
+  digitalWrite(in1, LOW);  digitalWrite(in2, HIGH);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+  analogWrite(enA, Lspd(spd));
+  analogWrite(enB, Rspd(spd));
+}
+
+void turnLeft(int spd)  { snapLeft(spd);  }
+void turnRight(int spd) { snapRight(spd); }
+
+void stopCar() {
+  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
+  analogWrite(enA, 0);    analogWrite(enB, 0);
+}
