@@ -23,7 +23,6 @@
 enum RobotMode { LINE_FOLLOWING, WALL_FOLLOWING };
 RobotMode mode = LINE_FOLLOWING;
 
-// ─── Transition detection ────────────────────────────────────────────────────
 int transitionCount = 0;
 const int TRANSITION_REQUIRED = 5;
 
@@ -33,6 +32,7 @@ const int TRANSITION_REQUIRED = 5;
 const int BASE_SPEED  = 130;
 const int TURN_SPEED  = 130;
 const int BACK_SPEED  = 130;
+const int CORNER_SPEED = 70;   // minimum speed on sharp corners
 const int leftBoost   = 0;
 const int rightBoost  = 25;
 
@@ -40,18 +40,28 @@ const int rightBoost  = 25;
 // LINE FOLLOWER SETTINGS
 // ═══════════════════════════════════════════════════════════════════════════
 const int IR_THRESHOLD = 400;
-const unsigned long SNAP_MS  = 100;
-const unsigned long LUNGE_MS = 80;
 
-int  lastTurn   = 1;
-bool inAllWhite = false;
-unsigned long allWhiteStart = 0;
+// PD gains — tune Kp first then Kd
+// Start: Kp=25, Kd=0 → increase Kd until oscillation stops
+const float LF_Kp = 25.0;
+const float LF_Kd = 10.0;
+
+float lfLastError = 0;
+int   lastTurn    = 1;   // -1=left, 1=right
+bool  wasLost     = false;
+
+bool          inAllWhite           = false;
+unsigned long allWhiteStart        = 0;
+bool          crossingIntersection = false;
+unsigned long intersectionTimer    = 0;
 const unsigned long INTERSECTION_THRESHOLD_MS = 100;
+const unsigned long INTERSECTION_CROSS_MS     = 200;
 
+const unsigned long SNAP_MS  = 300;  // increased for right-angle recovery
+const unsigned long LUNGE_MS = 80;
 enum RecoverState { SNAPPING, LUNGING };
-RecoverState recoverState = SNAPPING;
+RecoverState  recoverState = SNAPPING;
 unsigned long recoverTimer = 0;
-bool wasLost = false;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // WALL FOLLOWER SETTINGS
@@ -108,7 +118,7 @@ bool checkTransitionToWall(bool allWhiteTrigger) {
     transitionCount++;
     if (transitionCount >= TRANSITION_REQUIRED) {
       Serial.println(">>> SWITCHING TO WALL FOLLOWING <<<");
-      mode = WALL_FOLLOWING;
+      mode           = WALL_FOLLOWING;
       lastFrontDist  = FS;
       stuckTimer     = millis();
       wfLastError    = (float)(LS - LEFT_TARGET);
@@ -125,18 +135,24 @@ bool checkTransitionToWall(bool allWhiteTrigger) {
 // STAGE 1 — LINE FOLLOWER
 // ═══════════════════════════════════════════════════════════════════════════
 void runLineFollower() {
-  bool L = (analogRead(irLeft)  < IR_THRESHOLD);
-  bool M = (analogRead(irMid)   < IR_THRESHOLD);
-  bool R = (analogRead(irRight) < IR_THRESHOLD);
+  int rawL = analogRead(irLeft);
+  int rawM = analogRead(irMid);
+  int rawR = analogRead(irRight);
+
+  bool L = (rawL < IR_THRESHOLD);
+  bool M = (rawM < IR_THRESHOLD);
+  bool R = (rawR < IR_THRESHOLD);
 
   bool onLine = L || M || R;
 
+  // ── Re-found line after being lost ──────────────────────────────────────
   if (wasLost && onLine) {
-    wasLost = false;
+    wasLost         = false;
     transitionCount = 0;
+    lfLastError     = 0;
   }
 
-  // ── No line detected ───────────────────────────────────────────────────
+  // ── No line — recovery or transition ────────────────────────────────────
   if (!onLine) {
     if (checkTransitionToWall(false)) return;
 
@@ -148,6 +164,7 @@ void runLineFollower() {
 
     unsigned long elapsed = millis() - recoverTimer;
     if (recoverState == SNAPPING) {
+      // Snap hard in last known turn direction — 300ms for right angles
       if (lastTurn == -1) snapLeft(TURN_SPEED);
       else                snapRight(TURN_SPEED);
       if (elapsed >= SNAP_MS) {
@@ -164,15 +181,31 @@ void runLineFollower() {
     return;
   }
 
-  // ── All 3 sensors white — intersection or maze entry ──────────────────
+  // ── Crossing an intersection — drive straight through ───────────────────
+  if (crossingIntersection) {
+    moveStraight(BASE_SPEED);
+    if (millis() - intersectionTimer >= INTERSECTION_CROSS_MS) {
+      crossingIntersection = false;
+      inAllWhite           = false;
+      lfLastError          = 0;
+    }
+    return;
+  }
+
+  // ── All 3 sensors white — intersection or maze entry ────────────────────
   if (L && M && R) {
     if (!inAllWhite) {
       inAllWhite    = true;
       allWhiteStart = millis();
+      moveStraight(BASE_SPEED);
+      return;
     }
     if (millis() - allWhiteStart >= INTERSECTION_THRESHOLD_MS) {
       if (checkTransitionToWall(true)) return;
-      snapRight(TURN_SPEED);
+      // Real intersection — drive straight through
+      crossingIntersection = true;
+      intersectionTimer    = millis();
+      moveStraight(BASE_SPEED);
     } else {
       moveStraight(BASE_SPEED);
     }
@@ -181,16 +214,35 @@ void runLineFollower() {
 
   inAllWhite = false;
 
-  // ── Normal line following ──────────────────────────────────────────────
-  if (L && !R) {
-    lastTurn = -1;
-    snapLeft(TURN_SPEED);
-  } else if (R && !L) {
-    lastTurn = 1;
-    snapRight(TURN_SPEED);
-  } else {
-    moveStraight(BASE_SPEED);
-  }
+  // ── PD line following with corner speed scaling ──────────────────────────
+  float wL = (float)(1023 - rawL);
+  float wM = (float)(1023 - rawM);
+  float wR = (float)(1023 - rawR);
+  float total = wL + wM + wR;
+
+  float position = 0;
+  if (total > 0)
+    position = (-2.0 * wL + 0.0 * wM + 2.0 * wR) / total;
+
+  if (position < -0.3) lastTurn = -1;
+  if (position >  0.3) lastTurn =  1;
+
+  float derivative = position - lfLastError;
+  float correction = LF_Kp * position + LF_Kd * derivative;
+  lfLastError = position;
+
+  // Speed scales down as error grows — slowest at full deflection (±2)
+  float absPos     = abs(position);
+  float speedScale = 1.0 - constrain(absPos / 2.0, 0.0, 1.0);
+  int dynamicSpeed = CORNER_SPEED + (int)(speedScale * (BASE_SPEED - CORNER_SPEED));
+
+  int lSpd = constrain(dynamicSpeed - (int)correction, 30, 200);
+  int rSpd = constrain(dynamicSpeed + (int)correction, 30, 200);
+
+  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
+  analogWrite(enA, constrain(lSpd + leftBoost,  0, 255));
+  analogWrite(enB, constrain(rSpd + rightBoost, 0, 255));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -251,10 +303,8 @@ void runWallFollower() {
 // ═══════════════════════════════════════════════════════════════════════════
 void wallFollowStraight(long leftDist) {
   float error = 0;
-
-  if (leftDist < 999) {
+  if (leftDist < 999)
     error = (float)(leftDist - LEFT_TARGET);
-  }
 
   if (wfFirstReading) { wfLastError = error; wfFirstReading = false; }
 
